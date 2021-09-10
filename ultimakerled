@@ -1,0 +1,135 @@
+#!/usr/bin/env ruby
+
+require "bundler/inline"
+require "json"
+require "net/http"
+require "yaml"
+
+gemfile do
+  gem "net-http-digest_auth", "~> 1.4"
+end
+
+CONF_FILE = ENV["CONF"] || File.expand_path("~/.ultimaker-printers.yml")
+HEADERS = { "Accept" => "Application/json" }
+
+def authorize(uri)
+  res, auth = post(uri + "/api/v1/auth/request", { "application" => "ultimakerled", "user" => ENV["USER"], "exclusion_key" => "sak.ultimakerled" })
+  res.error! unless res.code == "200"
+  id = auth["id"]
+  key = auth["key"]
+  check = nil
+
+  puts "Go press Allow on printer"
+
+  loop do
+    res, check = get(uri + "/api/v1/auth/check/#{id}")
+    res.error! unless res.code == "200"
+
+    if check["message"] != "unknown"
+      break
+    end
+  end
+
+  if check["message"] == "authorized"
+    puts "Successfully authorized!"
+    return id, key
+  else
+    $stderr.puts("Failed to authorize")
+    exit 1
+  end
+end
+
+def request(method, uri, body: nil, headers: {}, _retry: false)
+  @digest ||= Net::HTTP::DigestAuth.new
+
+  @http ||= begin
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.start
+    http
+  end
+
+  headers = HEADERS.merge(headers)
+
+  if uri.user && uri.password && @previous_res && @previous_res["www-authenticate"]
+    headers["Authorization"] = @digest.auth_header(uri, @previous_res["www-authenticate"], method.to_s.upcase)
+  end
+
+  req = Net::HTTP.const_get(method.capitalize).new(uri.request_uri, headers)
+  res = @previous_res = @http.request(req, body)
+
+  if res.code == "401" && !_retry && uri.user && uri.password
+    return request(method, uri, body: body, headers: headers, _retry: true)
+  end
+
+  if res["Content-Type"] == "application/json"
+    data = JSON.parse(res.body)
+  end
+
+  [res, data]
+end
+
+def get(uri, headers: {})
+  request(:get, uri, headers: headers)
+end
+
+def post(uri, data, headers: {})
+  request(:post, uri, body: data.to_json, headers: { "Content-Type" => "application/json" }.merge(headers))
+end
+
+def put(uri, data, headers: {})
+  request(:put, uri, body: data.to_json, headers: { "Content-Type" => "application/json" }.merge(headers))
+end
+
+if ARGV.size == 2
+  host = ARGV.shift
+  brightness = ARGV.shift.to_i
+else
+  $stderr.puts("usage: #{$PROGRAM_NAME} host brightness")
+  exit 1
+end
+
+if File.exists?(CONF_FILE)
+  conf = YAML.load(File.read(CONF_FILE))
+else
+  conf = {}
+end
+
+uri = URI("http://#{host}/")
+
+if host_conf = conf[host]
+  uri.user = host_conf["username"]
+  uri.password = host_conf["password"]
+end
+
+if !uri.user
+  id, key = authorize(uri)
+  uri.user = id
+  uri.password = key
+  do_save = true
+end
+
+res, data = get(uri + "/api/v1/auth/verify")
+
+if res.code != "200" || data["message"] != "ok"
+  $stderr.puts("Authorization incorrect/expired")
+
+  id, key = authorize(uri)
+  uri.user = id
+  uri.password = key
+  do_save = true
+end
+
+res, data = put(uri + "/api/v1/printer/led/brightness", brightness)
+
+if res.code != "200" || data["result"] != true
+  $stderr.puts("Failed to set brightness: #{data["message"]}")
+else
+  puts "Set brightness to #{brightness}"
+end
+
+if do_save
+  conf[host] = {}
+  conf[host]["username"] = id
+  conf[host]["password"] = key
+  File.open(CONF_FILE, "w") { |f| f << conf.to_yaml }
+end
